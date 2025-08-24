@@ -94,28 +94,51 @@ def get_report(user_id, period="month"):
     records = ws.get_all_records()
 
     now = datetime.now()
-    total = 0
     filtered = []
+    totals_by_category = {}
+    report_lines = [f"-- REPORT --"]
 
     for row in records:
-        row_date = datetime.strptime(row["Date"], "%Y-%m-%d")
-        if period == "month" and row_date.month == now.month and row_date.year == now.year:
-            total += float(row["Amount"])
-            filtered.append(row)
-        elif period == "year" and row_date.year == now.year:
-            total += float(row["Amount"])
-            filtered.append(row)
-        elif period == "all":
-            total += float(row["Amount"])
-            filtered.append(row)
+        try:
+            row_date = datetime.strptime(row["Date"], "%Y-%m-%d")
+            amount = float(row["Amount"])
+            category = row["Category"]
+        except Exception:
+            continue
 
-    return total, filtered
+        if period == "month" and row_date.month == now.month and row_date.year == now.year:
+            filtered.append(row)
+            totals_by_category[category] = totals_by_category.get(category, 0) + amount
+        elif period == "year" and row_date.year == now.year:
+            filtered.append(row)
+            totals_by_category[category] = totals_by_category.get(category, 0) + amount
+        elif period == "all":
+            filtered.append(row)
+            totals_by_category[category] = totals_by_category.get(category, 0) + amount
+
+    if not filtered:
+        return "📊 No records found for this period."
+
+    if period == "month" and row_date.month == now.month and row_date.year == now.year:
+        report_lines.append(f"({period}) [ {row_date.month}/{row_date.year} ]")
+    elif period == "year" and row_date.year == now.year:
+        report_lines.append(f"({period}) [ {row_date.year} ]")
+
+    total_sum = 0
+    for cat, total in totals_by_category.items():
+        report_lines.append(f"- {cat}: {total:.2f}")
+        total_sum += total
+
+    report_lines.append(f"\n💰 Total: {total_sum:.2f}")
+
+    return "\n".join(report_lines)
+    # return total, filtered
 
 def process_category_step(message, user_id):
     category = message.text
-    if category not in CATEGORIES:
-        bot.reply_to(message, "❌ Invalid category. Try /add again or /back.")
-        return
+    # if category not in CATEGORIES:
+    #     bot.reply_to(message, "❌ Invalid category. Try /add again or /back.")
+    #     return
 
     msg = bot.send_message(message.chat.id, "Enter the amount:")
     bot.register_next_step_handler(msg, process_amount_step, user_id, category)
@@ -156,15 +179,16 @@ def help_command(message):
         bot.reply_to(message, "👋 Welcome! Use /register to create your personal expense sheet.")
         return
 
-    bot.reply_to(message, "👋 Please use Use:\n"
+    bot.reply_to(message, "👋 Shortchut:\n"
+        "/add <amount> <category>\n\n"
+        "    /add 9 Food \n\n\n"
+        "👋 Or use commands:\n"
         "/start - See your account details\n"
         "/register - Register your account or Renew your data\n"
         "/add - Add an expense\n"
-        "/add <amount> <category>\n"
-        "    -> Example: /add 9 Food \n"
         "/report - Show monthly/yearly report \n"
         "/help - Show all commands \n"
-        "or use the buttons bellow.")
+        "or choose the buttons bellow.")
     show_main_menu(message.chat.id)
 
 @bot.message_handler(func=lambda m: m.text == "📄 Help")
@@ -276,8 +300,8 @@ def process_report_step(message, user_id):
         return
 
     user_id = str(message.from_user.id)
-    total, _ = get_report(user_id, period=choice)
-    bot.reply_to(message, f"📊 Report ({choice}): total = {total}")
+    report = get_report(user_id, period=choice)
+    bot.reply_to(message, f"{report}")
     show_main_menu(message.chat.id)
 
 @bot.message_handler(func=lambda m: m.text == "♻️ Re-register")
