@@ -1,0 +1,7 @@
+-r requirements.txt   # inclui tudo do requirements normal
+
+black==24.8.0        # formatador automático de código
+flake8==7.1.1        # linting (verificação de estilo/erros)
+pytest==8.3.3        # rodar testes automatizados
+pytest-cov==5.0.0    # relatório de cobertura de testes
+isort==5.13.2        # organiza imports

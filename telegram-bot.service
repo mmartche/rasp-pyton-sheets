@@ -1,0 +1,13 @@
+[Unit]
+Description=Telegram Bot
+After=network.target
+
+[Service]
+ExecStart=/home/martche/Projects/rasp-pyton-sheets/venv/bin/python /home/martche/Projects/rasp-pyton-sheets/bot.py
+WorkingDirectory=/home/martche/Projects/rasp-pyton-sheets
+Restart=always
+User=martche
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
