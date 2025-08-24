@@ -1,159 +1,314 @@
+import os
+import json
 import telebot
 import gspread
-import json
-import os
-from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
-from collections import defaultdict
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+from datetime import datetime
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
+from google.oauth2.credentials import Credentials
+from telebot import types
+from dotenv import load_dotenv
 
-# ==== CONFIGURATION ====
-TELEGRAM_TOKEN = '8104853286:AAGAtRTUcvom5rprRPQhj2BlFKXZOXCr7Oo'
+# =======================
+# CONFIG
+# =======================
+load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TEMPLATE_SHEET_ID = os.getenv("TEMPLATE_SHEET_ID")
+
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# ==== Load user configuration ====
-if os.path.exists('users_config.json'):
-    with open('users_config.json', 'r') as f:
-        USERS_CONFIG = json.load(f)
-else:
-    USERS_CONFIG = {}
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 
-# ==== Function: get user sheet ====
+# Carrega credenciais salvas pelo auth_setup.py
+creds = Credentials.from_authorized_user_file("token.json", SCOPES)
 
-def get_user_sheet(user_id):
-    """Return the Google Sheet object for the given user_id."""
-    user_id_str = str(user_id)
-    if user_id_str not in USERS_CONFIG:
-        return None, "User not registered. Use /register to start."
+# GSpread client
+gspread_client = gspread.authorize(creds)
 
-    config = USERS_CONFIG[user_id_str]
-    creds_file = config['credentials_file']
-    spreadsheet_id = config['spreadsheet_id']
+CATEGORIES = ["Food", "Transport", "Entertainment", "Other"]
 
+# =======================
+# USER DATA PERSISTENCE
+# =======================
+USER_FILE = "users.json"
+user_data = {}
+
+def load_users():
+    global user_data
+    if os.path.exists(USER_FILE):
+        with open(USER_FILE, "r") as f:
+            user_data = json.load(f)
+    else:
+        user_data = {}
+
+def save_users():
+    with open(USER_FILE, "w") as f:
+        json.dump(user_data, f, indent=2)
+
+# =======================
+# MENU
+# =======================
+def show_main_menu(chat_id):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+    markup.add(
+        KeyboardButton("➕ Add Expense")
+    )
+    markup.add(
+        KeyboardButton("📊 Quick Report"),
+        KeyboardButton("📅 Full Report"),
+        KeyboardButton("📄 Help")
+    )
+    bot.send_message(chat_id, "Choose an option:", reply_markup=markup)
+
+# =======================
+# SHEETS FUNCTIONS
+# =======================
+def create_user_sheet(username):
+    drive_service = build("drive", "v3", credentials=creds)
+    new_file = {
+        "name": f"Expenses_{username}",
+        "mimeType": "application/vnd.google-apps.spreadsheet"
+    }
+    copied = drive_service.files().copy(
+        fileId=TEMPLATE_SHEET_ID, body=new_file
+    ).execute()
+
+    return copied["id"]
+
+def add_expense(user_id, category, amount, date=None):
+    if not date:
+        date = datetime.now().strftime("%Y-%m-%d")
+    
+    sheet_id = user_data[user_id]["sheet_id"]
+    sheet = gspread_client.open_by_key(sheet_id).sheet1
+    sheet.append_row([date, category, amount])
+
+def get_report(user_id, period="month"):
+    sheet_id = user_data[user_id]["sheet_id"]
+    sheet = gspread_client.open_by_key(sheet_id)
+    ws = sheet.sheet1
+    records = ws.get_all_records()
+
+    now = datetime.now()
+    total = 0
+    filtered = []
+
+    for row in records:
+        row_date = datetime.strptime(row["Date"], "%Y-%m-%d")
+        if period == "month" and row_date.month == now.month and row_date.year == now.year:
+            total += float(row["Amount"])
+            filtered.append(row)
+        elif period == "year" and row_date.year == now.year:
+            total += float(row["Amount"])
+            filtered.append(row)
+        elif period == "all":
+            total += float(row["Amount"])
+            filtered.append(row)
+
+    return total, filtered
+
+def process_category_step(message, user_id):
+    category = message.text
+    if category not in CATEGORIES:
+        bot.reply_to(message, "❌ Invalid category. Try /add again or /back.")
+        return
+
+    msg = bot.send_message(message.chat.id, "Enter the amount:")
+    bot.register_next_step_handler(msg, process_amount_step, user_id, category)
+
+def process_amount_step(message, user_id, category):
     try:
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name(creds_file, scope)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_key(spreadsheet_id).sheet1
-        return sheet, None
-    except Exception as e:
-        return None, f"Error accessing your sheet: {e}"
+        amount = float(message.text)
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid number. Try /add again or /back.")
+        return
 
-# ==== Command: /start ====
+    add_expense(user_id, category, amount)
+    bot.reply_to(message, f"✅ Added {amount} to {category}.")
+    show_main_menu(message.chat.id)
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.reply_to(message, "Hello! 👋\nUse /register to register your account.\n\nTo register expenses:\n/expense amount category description\n\nTo get your monthly report:\n/report")
+# =======================
+# HANDLERS
+# =======================
+@bot.message_handler(commands=["start", "back"])
+def welcome(message):
+    user_id = str(message.from_user.id)
+    if user_id not in user_data:
+        bot.reply_to(message, "👋 Welcome! Use /register to create your personal expense sheet.")
+        return
 
-# ==== Command: /register ====
+    username = message.from_user.username or f"{user_id}"
+    bot.reply_to(message, "👋 Welcome! user: "+username)
+    show_main_menu(message.chat.id)
 
-@bot.message_handler(commands=['register'])
+@bot.message_handler(func=lambda m: m.text == "♻️ Back")
+def back_button(message):
+    welcome(message)
+
+@bot.message_handler(commands=["help"])
+def help_command(message):
+    user_id = str(message.from_user.id)
+    if user_id not in user_data:
+        bot.reply_to(message, "👋 Welcome! Use /register to create your personal expense sheet.")
+        return
+
+    bot.reply_to(message, "👋 Please use Use:\n"
+        "/start - See your account details\n"
+        "/register - Register your account or Renew your data\n"
+        "/add - Add an expense\n"
+        "/add <amount> <category>\n"
+        "    -> Example: /add 9 Food \n"
+        "/report - Show monthly/yearly report \n"
+        "/help - Show all commands \n"
+        "or use the buttons bellow.")
+    show_main_menu(message.chat.id)
+
+@bot.message_handler(func=lambda m: m.text == "📄 Help")
+def help_button(message):
+    help_command(message)
+
+@bot.message_handler(commands=["register"])
 def register_user(message):
     user_id = str(message.from_user.id)
-    username = message.from_user.username
+    username = message.from_user.username or f"user{user_id}"
 
-    if user_id in USERS_CONFIG:
-        bot.reply_to(message, "✅ You are already registered.")
+    sheet_id = create_user_sheet(username)
+    user_data[user_id] = {"username": username, "sheet_id": sheet_id}
+    save_users()
+
+    bot.reply_to(message, f"✅ Registered! Your sheet is ready: https://docs.google.com/spreadsheets/d/{sheet_id}")
+    show_main_menu(message.chat.id)
+
+@bot.message_handler(commands=["add"])
+def add_expense_command(message):
+    """
+    /add <amount> <category>
+    Example: /add 9 Food
+    """
+    user_id = str(message.from_user.id)
+    if user_id not in user_data:
+        bot.reply_to(message, "⚠️ You are not registered. Use /register first.")
         return
 
-    msg = bot.reply_to(message, "Please send your Google Spreadsheet ID to link your account.")
-    bot.register_next_step_handler(msg, process_spreadsheet_id, user_id, username)
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+        for c in CATEGORIES:
+            markup.add(c)
 
-def process_spreadsheet_id(message, user_id, username):
-    spreadsheet_id = message.text.strip()
+        markup.add(
+            KeyboardButton("♻️ Back")
+        )
+        msg = bot.send_message(message.chat.id, "Select a category:", reply_markup=markup)
+        bot.register_next_step_handler(msg, process_category_step, user_id)
+        return
+    
+    if message.text == "➕ Add Expense":
+        markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+        for c in CATEGORIES:
+            markup.add(c)
 
-    # Use a default credentials file for all users
-    default_credentials_file = 'credentials.json'
-
-    # Load existing config
-    if os.path.exists('users_config.json'):
-        with open('users_config.json', 'r') as f:
-            users_config = json.load(f)
-    else:
-        users_config = {}
-
-    # Add the new user
-    users_config[user_id] = {
-        "credentials_file": default_credentials_file,
-        "spreadsheet_id": spreadsheet_id
-    }
-
-    # Save back to file
-    with open('users_config.json', 'w') as f:
-        json.dump(users_config, f, indent=4)
-
-    # Update global variable
-    global USERS_CONFIG
-    USERS_CONFIG = users_config
-
-    bot.reply_to(message, f"✅ Registration completed!\nYour data is now linked to Spreadsheet ID:\n{spreadsheet_id}")
-
-# ==== Command: /expense ====
-
-@bot.message_handler(commands=['expense'])
-def register_expense(message):
-    user_id = message.from_user.id
-    sheet, error = get_user_sheet(user_id)
-    if error:
-        bot.reply_to(message, error)
+        markup.add(
+            KeyboardButton("♻️ Back")
+        )
+        msg = bot.send_message(message.chat.id, "Select a category:", reply_markup=markup)
+        bot.register_next_step_handler(msg, process_category_step, user_id)
         return
 
     try:
-        parts = message.text.split(maxsplit=3)
-        if len(parts) < 4:
-            bot.reply_to(message, "❌ Incorrect format. Use:\n/expense amount category description")
-            return
-        
-        amount = float(parts[1].replace(',', '.'))
+        amount = float(parts[1])
         category = parts[2]
-        description = parts[3]
-        date = datetime.now().strftime("%d/%m/%Y")
-        username = message.from_user.username
-
-        # Append to user-specific Google Sheet
-        sheet.append_row([date, amount, category, description, str(user_id), username])
-
-        bot.reply_to(message, f"✅ Expense of R${amount:.2f} registered in *{category}*.", parse_mode="Markdown")
-
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error registering expense: {e}")
-
-# ==== Command: /report ====
-
-@bot.message_handler(commands=['report'])
-def report(message):
-    user_id = message.from_user.id
-    sheet, error = get_user_sheet(user_id)
-    if error:
-        bot.reply_to(message, error)
+    except ValueError:
+        bot.reply_to(message, "Amount must be a number.")
+        show_main_menu(message.chat.id)
         return
 
-    try:
-        records = sheet.get_all_records()
+    add_expense(user_id, category, amount)
+    bot.send_message(message.chat.id, f"✅ Added {amount} to category {category}.")
+    show_main_menu(message.chat.id)
 
-        current_month = datetime.now().strftime("%m/%Y")
-        total_month = 0
-        category_totals = defaultdict(float)
+@bot.message_handler(func=lambda m: m.text == "➕ Add Expense")
+def add_expense_button(message):
+    add_expense_command(message)
 
-        for r in records:
-            if str(r['User_ID']) == str(user_id):
-                record_date = datetime.strptime(r['Data'], "%d/%m/%Y")
-                record_month = record_date.strftime("%m/%Y")
-                if record_month == current_month:
-                    value = float(r['Valor'])
-                    total_month += value
-                    category_totals[r['Categoria']] += value
+@bot.message_handler(commands=["full_report"])
+def sheet_link_command(message):
+    user_id = str(message.from_user.id)
+    if user_id not in user_data:
+        bot.reply_to(message, "⚠️ You are not registered. Use /register first.")
+        return
 
-        response = f"📊 *Report for this month ({current_month}):*\nTotal: R${total_month:.2f}\n"
-        for cat, val in category_totals.items():
-            response += f"- {cat}: R${val:.2f}\n"
+    sheet_id = user_data[user_id]["sheet_id"]
+    bot.reply_to(message, f"📄 Here is your full report: https://docs.google.com/spreadsheets/d/{sheet_id}")
+    show_main_menu(message.chat.id)
 
-        bot.reply_to(message, response, parse_mode="Markdown")
+@bot.message_handler(func=lambda m: m.text == "📅 Full Report")
+def sheet_link_button(message):
+    sheet_link_command(message)
 
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error generating report: {e}")
+@bot.message_handler(commands=["report"])
+def report_command(message):
+    user_id = str(message.from_user.id)
+    if user_id not in user_data:
+        bot.reply_to(message, "⚠️ You must /register first.")
+        return
 
-# ==== START BOT ====
-print("🤖 Bot is running...")
-bot.polling()
+    markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+    markup.add("Month", "Year", "All")
+    markup.add(
+        KeyboardButton("♻️ Back")
+    )
+    msg = bot.send_message(message.chat.id, "Which report?", reply_markup=markup)
+    bot.register_next_step_handler(msg, process_report_step, user_id)
+
+@bot.message_handler(func=lambda m: m.text == "📊 Quick Report")
+def report_button(message):
+    report_command(message)
+
+def process_report_step(message, user_id):
+    choice = message.text.lower()
+    if choice not in ["month", "year", "all"]:
+        bot.reply_to(message, "❌ Invalid choice. Use /report again or /back.")
+        return
+
+    user_id = str(message.from_user.id)
+    total, _ = get_report(user_id, period=choice)
+    bot.reply_to(message, f"📊 Report ({choice}): total = {total}")
+    show_main_menu(message.chat.id)
+
+@bot.message_handler(func=lambda m: m.text == "♻️ Re-register")
+def re_register_button(message):
+    register_user(message)
+
+# =======================
+# FALLBACK HANDLER
+# =======================
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def fallback(message):
+    known_options = [
+        "➕ Add Expense",
+        "📊 Quick Report",
+        "📅 Full Report",
+        "♻️ Re-register",
+        "♻️ Back",
+        "📄 Help"
+    ]
+    if message.text not in known_options and not message.text.startswith("/"):
+        bot.reply_to(message, "❌ Option not recognized. Please use Use:\n"
+        "/add - Add an expense\n"
+        "/report - Show monthly/yearly report \n"
+        "/help - Show all commands \n"
+        "or use the buttons bellow.")
+        show_main_menu(message.chat.id)
+
+# =======================
+# START BOT
+# =======================
+if __name__ == "__main__":
+    load_users()
+    print("🤖 Bot is running...")
+    bot.infinity_polling()
