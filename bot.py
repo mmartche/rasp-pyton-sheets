@@ -29,7 +29,7 @@ creds = Credentials.from_authorized_user_file("token.json", SCOPES)
 # GSpread client
 gspread_client = gspread.authorize(creds)
 
-CATEGORIES = ["Food", "Transport", "Entertainment", "Other"]
+CATEGORIES = ["Food", "Transport", "Entertainment", "Emergency", "Other"]
 
 # =======================
 # USER DATA PERSISTENCE
@@ -55,7 +55,8 @@ def save_users():
 def show_main_menu(chat_id):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
     markup.add(
-        KeyboardButton("➕ Add Expense")
+        KeyboardButton("➕ Add Expense"),
+        KeyboardButton("🗑 Remove Expense")
     )
     markup.add(
         KeyboardButton("📊 Quick Report"),
@@ -81,11 +82,13 @@ def create_user_sheet(username):
 
 def add_expense(user_id, category, amount, date=None):
     if not date:
-        date = datetime.now().strftime("%Y-%m-%d")
+        date = datetime.now().strftime("%Y/%m/%d")
     
     sheet_id = user_data[user_id]["sheet_id"]
     sheet = gspread_client.open_by_key(sheet_id).sheet1
-    sheet.append_row([date, category, amount])
+    sheet.append_row([date, category, amount],
+                     value_input_option="USER_ENTERED"
+                     )
 
 def get_report(user_id, period="month"):
     sheet_id = user_data[user_id]["sheet_id"]
@@ -100,7 +103,7 @@ def get_report(user_id, period="month"):
 
     for row in records:
         try:
-            row_date = datetime.strptime(row["Date"], "%Y-%m-%d")
+            row_date = datetime.strptime(row["Date"], "%Y/%m/%d")
             amount = float(row["Amount"])
             category = row["Category"]
         except Exception:
@@ -135,6 +138,10 @@ def get_report(user_id, period="month"):
     # return total, filtered
 
 def process_category_step(message, user_id):
+    if message.text == "❌ Cancel":
+        welcome(message)
+        return
+
     category = message.text
     # if category not in CATEGORIES:
     #     bot.reply_to(message, "❌ Invalid category. Try /add again or /back.")
@@ -144,15 +151,43 @@ def process_category_step(message, user_id):
     bot.register_next_step_handler(msg, process_amount_step, user_id, category)
 
 def process_amount_step(message, user_id, category):
+    if message.text == "❌ Cancel":
+        bot.send_message(message.chat.id, "Cancelled! Back to main menu ⬇️")
+        show_main_menu(message)
+        return
+
     try:
-        amount = float(message.text)
+        amount_text = message.text.replace(",", ".")
+        amount = float(amount_text)
     except ValueError:
-        bot.reply_to(message, "❌ Invalid number. Try /add again or /back.")
+        bot.reply_to(message, "❌ Invalid number. Please enter a number (e.g. 12.5 or 12,5). Or Try /add again or /back.")
         return
 
     add_expense(user_id, category, amount)
     bot.reply_to(message, f"✅ Added {amount} to {category}.")
     show_main_menu(message.chat.id)
+
+def get_last_expenses(user_id, limit=5):
+    sheet_id = user_data[user_id]["sheet_id"]
+    sheet = gspread_client.open_by_key(sheet_id).sheet1
+    records = sheet.get_all_records()
+
+    if not records:
+        return None, "📭 No expenses found."
+
+    last_records = records[-limit:]
+    return last_records, None
+
+def remove_expense(user_id, row_index):
+    sheet_id = user_data[user_id]["sheet_id"]
+    sheet = gspread_client.open_by_key(sheet_id).sheet1
+    records = sheet.get_all_records()
+
+    if row_index < 0 or row_index >= len(records):
+        return "⚠️ Invalid record number."
+
+    sheet.delete_rows(row_index + 2)
+    return "🗑 Expense removed successfully!"
 
 # =======================
 # HANDLERS
@@ -237,14 +272,15 @@ def add_expense_command(message):
             markup.add(c)
 
         markup.add(
-            KeyboardButton("♻️ Back")
+            KeyboardButton("❌ Cancel")
         )
         msg = bot.send_message(message.chat.id, "Select a category:", reply_markup=markup)
         bot.register_next_step_handler(msg, process_category_step, user_id)
         return
 
     try:
-        amount = float(parts[1])
+        amount_text = parts[1].replace(",", ".")
+        amount = float(amount_text)
         category = parts[2]
     except ValueError:
         bot.reply_to(message, "Amount must be a number.")
@@ -308,6 +344,66 @@ def process_report_step(message, user_id):
 def re_register_button(message):
     register_user(message)
 
+@bot.message_handler(commands=["remove"])
+def choose_expense_to_remove(message):
+    user_id = str(message.from_user.id)
+    if user_id not in user_data:
+        bot.reply_to(message, "⚠️ You must /register first.")
+        return
+
+    last_records, error = get_last_expenses(user_id)
+
+    if error:
+        bot.reply_to(message, error)
+        return
+
+    markup = types.InlineKeyboardMarkup()
+    for i, row in enumerate(last_records):
+
+        row_date = datetime.strptime(row["Date"], "%Y/%m/%d")
+
+        label = f"{row_date.day}/{row_date.month} - {row['Category']} - $ {row['Amount']:.2f}"
+        markup.add(types.InlineKeyboardButton(
+            text=label, callback_data=f"remove:{len(last_records) - i}"
+        ))
+    markup.add(
+        types.InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "🗑 Select the expense you want to remove:",
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("remove:") or call.data == "cancel")
+def handle_remove_callback(call):
+    user_id = str(call.from_user.id)
+    if user_id not in user_data:
+        bot.reply_to(call, "⚠️ You must /register first.")
+        return
+
+    if call.data == "cancel":
+        bot.answer_callback_query(call.id, "Cancelled ❌")
+        bot.send_message(call.message.chat.id, "Back to main menu ⬇️")
+        show_main_menu(call.message)
+        return
+
+    index = int(call.data.split(":")[1])
+    sheet_id = user_data[user_id]["sheet_id"]
+    sheet = gspread_client.open_by_key(sheet_id).sheet1
+    total_records = len(sheet.get_all_records())
+
+    row_index = total_records - index  # converte para índice real
+    result = remove_expense(user_id, row_index)
+
+    bot.answer_callback_query(call.id, result)
+    bot.send_message(call.message.chat.id, result)
+
+@bot.message_handler(func=lambda m: m.text == "🗑 Remove Expense")
+def choose_expense_to_remove_button(message):
+    choose_expense_to_remove(message)
+
 # =======================
 # FALLBACK HANDLER
 # =======================
@@ -317,6 +413,7 @@ def fallback(message):
         "➕ Add Expense",
         "📊 Quick Report",
         "📅 Full Report",
+        "🗑 Remove Expense",
         "♻️ Re-register",
         "♻️ Back",
         "📄 Help"
@@ -324,6 +421,7 @@ def fallback(message):
     if message.text not in known_options and not message.text.startswith("/"):
         bot.reply_to(message, "❌ Option not recognized. Please use Use:\n"
         "/add - Add an expense\n"
+        "/remove - Remove an expense\n"
         "/report - Show monthly/yearly report \n"
         "/help - Show all commands \n"
         "or use the buttons bellow.")
