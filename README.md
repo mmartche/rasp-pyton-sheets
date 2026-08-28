@@ -7,7 +7,7 @@ source venv/bin/activate
 pip install -r requirements-dev.txt
 python3 index.py
 
-* run auth_setup.py to generate oauth token json
+* run python3 auth_setup.py to generate oauth token json
 
 * with systemd
 sudo nano /etc/systemd/system/telegram-bot.service
@@ -27,3 +27,6 @@ sudo systemctl restart telegram-bot
 
 Logs real time:
 journalctl -u telegram-bot -f
+
+update google credentials
+python3 .\auth_setup.py
